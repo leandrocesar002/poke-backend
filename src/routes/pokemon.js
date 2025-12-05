@@ -15,7 +15,10 @@ const getCachedOrFetch = async (key, fetchFn) => {
     return cached.data;
   }
   const data = await fetchFn();
-  cache.set(key, { data, timestamp: Date.now() });
+
+  if (data && (Array.isArray(data) ? data.length > 0 : true)) {
+    cache.set(key, { data, timestamp: Date.now() });
+  }
   return data;
 };
 
@@ -42,12 +45,14 @@ router.get('/', authMiddleware, async (req, res, next) => {
       }));
     });
 
-    // Filter by search term
-    let filtered = allPokemon;
-    if (search) {
-      filtered = allPokemon.filter(p =>
-        p.name.includes(search) || p.number.toString().includes(search)
+    let filtered;
+    if (search && search.trim().length > 0) {
+      const searchTerms = search.split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+      filtered = allPokemon.filter(p => 
+        searchTerms.some(term => p.name.indexOf(term) !== -1)
       );
+    } else {
+      filtered = [...allPokemon];
     }
 
     // Sort
@@ -65,8 +70,8 @@ router.get('/', authMiddleware, async (req, res, next) => {
     // Fetch details for paginated results
     const pokemonDetails = await Promise.all(
       paginated.map(async (p) => {
-        return getCachedOrFetch(`pokemon-${p.number}`, async () => {
-          const response = await axios.get(`${POKEAPI_BASE}/pokemon/${p.number}`);
+        return getCachedOrFetch(`pokemon-${p.name}`, async () => {
+          const response = await axios.get(`${POKEAPI_BASE}/pokemon/${p.name}`);
           return {
             id: response.data.id,
             name: response.data.name,
@@ -98,6 +103,90 @@ router.get('/', authMiddleware, async (req, res, next) => {
 });
 
 /**
+ * GET /api/pokemons/number/:numbers
+ * Returns Pokémon by number(s) - supports multiple numbers separated by comma
+ * Examples: /number/4, /number/004, /number/1,4,25
+ */
+router.get('/number/:numbers', authMiddleware, async (req, res, next) => {
+  try {
+    const { numbers } = req.params;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const offset = parseInt(req.query.offset) || 0;
+
+    if (!numbers) {
+      return res.status(400).json({
+        success: false,
+        error: 'Number parameter is required'
+      });
+    }
+
+    const searchNumbers = numbers
+      .split(',')
+      .map(n => parseInt(n.trim(), 10))
+      .filter(n => !isNaN(n));
+
+    if (searchNumbers.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one valid number is required'
+      });
+    }
+
+    const allPokemon = await getCachedOrFetch('all-pokemon', async () => {
+      const response = await axios.get(`${POKEAPI_BASE}/pokemon?limit=1500`);
+      return response.data.results.map((p, index) => ({
+        name: p.name,
+        number: index + 1,
+        url: p.url
+      }));
+    });
+
+    const filtered = allPokemon.filter(p => searchNumbers.includes(p.number));
+
+    if (filtered.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          results: [],
+          pagination: { total: 0, limit, offset, hasNext: false, hasPrev: false }
+        }
+      });
+    }
+
+    filtered.sort((a, b) => searchNumbers.indexOf(a.number) - searchNumbers.indexOf(b.number));
+
+    const total = filtered.length;
+    const paginated = filtered.slice(offset, offset + limit);
+
+    const pokemonDetails = await Promise.all(
+      paginated.map(async (p) => {
+        return getCachedOrFetch(`pokemon-${p.name}`, async () => {
+          const response = await axios.get(`${POKEAPI_BASE}/pokemon/${p.name}`);
+          return {
+            id: response.data.id,
+            name: response.data.name,
+            number: response.data.id,
+            image: response.data.sprites.other['official-artwork'].front_default ||
+                   response.data.sprites.front_default,
+            types: response.data.types.map(t => t.type.name)
+          };
+        });
+      })
+    );
+
+    res.json({
+      success: true,
+      data: {
+        results: pokemonDetails,
+        pagination: { total, limit, offset, hasNext: offset + limit < total, hasPrev: offset > 0 }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * GET /api/pokemons/:id
  * Returns detailed information about a specific Pokémon
  */
@@ -113,12 +202,18 @@ router.get('/:id', authMiddleware, async (req, res, next) => {
     }
 
     const pokemonData = await getCachedOrFetch(`pokemon-detail-${id}`, async () => {
-      const [pokemon, species] = await Promise.all([
-        axios.get(`${POKEAPI_BASE}/pokemon/${id}`),
-        axios.get(`${POKEAPI_BASE}/pokemon-species/${id}`)
-      ]);
+      const pokemon = await axios.get(`${POKEAPI_BASE}/pokemon/${id}`);
+      
+      let species = null;
+      try {
+        species = await axios.get(`${POKEAPI_BASE}/pokemon-species/${id}`);
+      } catch (speciesError) {
+        if (pokemon.data.species?.url) {
+          species = await axios.get(pokemon.data.species.url);
+        }
+      }
 
-      return {
+      const result = {
         id: pokemon.data.id,
         name: pokemon.data.name,
         number: pokemon.data.id,
@@ -132,8 +227,8 @@ router.get('/:id', authMiddleware, async (req, res, next) => {
           artwork: pokemon.data.sprites.other['official-artwork'].front_default
         },
         types: pokemon.data.types.map(t => t.type.name),
-        height: pokemon.data.height / 10, // Convert to meters
-        weight: pokemon.data.weight / 10, // Convert to kg
+        height: pokemon.data.height / 10,
+        weight: pokemon.data.weight / 10,
         abilities: pokemon.data.abilities.map(a => ({
           name: a.ability.name,
           isHidden: a.is_hidden
@@ -145,19 +240,30 @@ router.get('/:id', authMiddleware, async (req, res, next) => {
         stats: pokemon.data.stats.map(s => ({
           name: s.stat.name,
           value: s.base_stat
-        })),
-        forms: species.data.varieties.map(v => ({
+        }))
+      };
+
+      if (species?.data) {
+        result.forms = species.data.varieties?.map(v => ({
           name: v.pokemon.name,
           isDefault: v.is_default
-        })),
-        description: species.data.flavor_text_entries
-          .find(e => e.language.name === 'en')?.flavor_text
-          .replace(/\f/g, ' ') || 'No description available',
-        genus: species.data.genera
-          .find(g => g.language.name === 'en')?.genus || 'Unknown',
-        habitat: species.data.habitat?.name || 'Unknown',
-        generation: species.data.generation.name
-      };
+        })) || [];
+        result.description = species.data.flavor_text_entries
+          ?.find(e => e.language.name === 'en')?.flavor_text
+          ?.replace(/\f/g, ' ') || 'No description available';
+        result.genus = species.data.genera
+          ?.find(g => g.language.name === 'en')?.genus || 'Unknown';
+        result.habitat = species.data.habitat?.name || 'Unknown';
+        result.generation = species.data.generation?.name || 'Unknown';
+      } else {
+        result.forms = [];
+        result.description = 'No description available';
+        result.genus = 'Unknown';
+        result.habitat = 'Unknown';
+        result.generation = 'Unknown';
+      }
+
+      return result;
     });
 
     res.json({
