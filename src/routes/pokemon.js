@@ -9,6 +9,11 @@ const POKEAPI_BASE = 'https://pokeapi.co/api/v2';
 const cache = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
+// Export cache for testing
+if (process.env.NODE_ENV === 'test') {
+  module.exports.__cache = cache;
+}
+
 const getCachedOrFetch = async (key, fetchFn) => {
   const cached = cache.get(key);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
@@ -282,5 +287,10 @@ router.get('/:id', authMiddleware, async (req, res, next) => {
 });
 
 module.exports = router;
+
+// Export cache for testing
+if (process.env.NODE_ENV === 'test') {
+  module.exports.__cache = cache;
+}
 
 

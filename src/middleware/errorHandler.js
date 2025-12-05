@@ -2,7 +2,7 @@
  * Global error handler middleware
  */
 const errorHandler = (err, req, res, next) => {
-  console.error('Error:', err.message);
+  console.error('Error:', err.message || err);
 
   // Axios errors (from PokeAPI)
   if (err.response) {
